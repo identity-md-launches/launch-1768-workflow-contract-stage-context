@@ -7,6 +7,8 @@ import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
@@ -29,6 +31,8 @@ contract RejectingPayee {
 /// are caught here and turned into violation flags when they do NOT fail, so the suite can run with
 /// `fail-on-revert = true` and still surface any unexpected revert as a failure.
 contract RektJackpotHandler is Test {
+    using PoolIdLibrary for PoolKey;
+
     uint256 constant BPS = 10_000;
     address constant OWNER = 0x08cD4437B077928E7fA09CF7dcDf3F7624743Bd2;
     address constant DEAD = 0x000000000000000000000000000000000000dEaD;
@@ -51,6 +55,8 @@ contract RektJackpotHandler is Test {
     uint256 public ghostSettleRoundCalls;
     uint256 public ghostParkedEvents;
     uint256 public ghostRoundsStarted;
+    uint256 public ghostRecycled; // ETH returned to the jackpot by recycleParkedPayout
+    mapping(address => uint256) public firstParkedAt; // when a payee's current parked amount first failed
 
     // Violation reporting: the first broken postcondition and where it happened.
     bool public violated;
@@ -322,15 +328,100 @@ contract RektJackpotHandler is Test {
     function warp(uint256 seconds_) external {
         seconds_ = bound(seconds_, 1, 900);
         vm.warp(block.timestamp + seconds_);
+        _checkClock();
+    }
+
+    /// @dev Long jumps so parked payouts can pass the one-day grace period within a sequence.
+    function warpLong(uint256 seconds_) external {
+        seconds_ = bound(seconds_, 1 days, 3 days);
+        vm.warp(block.timestamp + seconds_);
+        _checkClock();
+    }
+
+    function _checkClock() internal {
         bool running = hook.currentLeader() != address(0);
-        _flag(
-            hook.roundExpired() == (running && block.timestamp > hook.roundEndTime()),
-            "roundExpired disagrees with the countdown"
+        uint256 end = hook.roundEndTime();
+        bool expired = running && block.timestamp > end;
+        _flag(hook.roundExpired() == expired, "roundExpired disagrees with the countdown");
+        uint256 remaining = hook.timeRemaining();
+        _flag((remaining == 0) == (!running || expired), "timeRemaining is zero exactly when the round is not live");
+        if (running && !expired) {
+            uint256 left = end - block.timestamp;
+            _flag(remaining == (left == 0 ? 1 : left), "timeRemaining is not the seconds left (1 in the end second)");
+            _flag(remaining <= 600, "timeRemaining above the round cap");
+        }
+    }
+
+    /// @dev An exact-input buy stopped by a price limit one unit under the current price: the pool
+    /// takes a few wei, the hook still charges 1% of the specified amount, and the ticket is judged on
+    /// the ETH really paid (pool input plus fee), never on the amount specified.
+    function buyExactInLimited(uint256 ethIn, uint256 actorSeed) external {
+        ethIn = bound(ethIn, 1, 10 ether);
+        address buyer = _actor(actorSeed);
+        (uint160 sqrtPrice,,,) = StateLibrary.getSlot0(manager, key.toId());
+        if (sqrtPrice <= TickMath.MIN_SQRT_PRICE + 1) return;
+        Snap memory s = _snap();
+        uint256 ethBefore = address(this).balance;
+
+        swapRouter.swap{value: ethIn}(
+            key,
+            SwapParams({zeroForOne: true, amountSpecified: -int256(ethIn), sqrtPriceLimitX96: sqrtPrice - 1}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            abi.encode(buyer)
         );
+        ghostSwaps++;
+
+        uint256 paid = ethBefore - address(this).balance;
+        uint256 fee = ethIn / 100;
+        _flag(paid >= fee && paid <= ethIn, "limited buy paid outside [fee, specified]");
+        _flag(paid - fee < 10, "a buy limited one unit under the price should trade only a few wei");
+        _checkSwapAccounting(s, fee);
+        _checkTicket(s, paid, buyer);
+        _snapshotMonotonic();
+    }
+
+    /// @dev An exact-output sell stopped by a price limit one unit above the current price cannot
+    /// output the ETH asked plus the fee: it must be refused outright and leave no trace, including
+    /// the settlement beforeSwap would have recorded for an expired round.
+    function sellExactOutLimited(uint256 ethOut, uint256 actorSeed) external {
+        ethOut = bound(ethOut, 1, 10 ether);
+        (uint160 sqrtPrice,,,) = StateLibrary.getSlot0(manager, key.toId());
+        if (sqrtPrice >= TickMath.MAX_SQRT_PRICE - 1) return;
+        Snap memory s = _snap();
+        uint256 ethBefore = address(this).balance;
+        uint256 tokBefore = token.balanceOf(address(this));
+
+        bool reverted;
+        try swapRouter.swap(
+            key,
+            SwapParams({zeroForOne: false, amountSpecified: int256(ethOut), sqrtPriceLimitX96: sqrtPrice + 1}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            abi.encode(_actor(actorSeed))
+        ) {}
+        catch (bytes memory reason) {
+            reverted = true;
+            _flag(_contains(reason, RektJackpotHook.EthOutputNotFilled.selector), "unfillable sell: wrong reason");
+        }
+        _flag(reverted, "an unfillable exact-output sell was not refused");
         _flag(
-            (hook.timeRemaining() == 0) == (!running || block.timestamp >= hook.roundEndTime()),
-            "timeRemaining disagrees with the countdown"
+            address(this).balance == ethBefore && token.balanceOf(address(this)) == tokBefore,
+            "refused sell moved funds"
         );
+        _flag(hook.totalFeesCollected() == s.fees && _claims() == s.claims, "refused sell charged a fee");
+        _flag(hook.jackpotPool() == s.pool && hook.pendingCreatorFees() == s.pending, "refused sell changed accounting");
+        _flag(hook.currentLeader() == s.leader && hook.roundEndTime() == s.endTime, "refused sell changed the round");
+        _flag(hook.unclaimedPayout(s.leader) == s.unclaimedLeader, "refused sell left an in-swap settlement behind");
+    }
+
+    function _contains(bytes memory data, bytes4 selector) internal pure returns (bool) {
+        if (data.length < 4) return false;
+        for (uint256 i = 0; i + 4 <= data.length; i++) {
+            if (
+                data[i] == selector[0] && data[i + 1] == selector[1] && data[i + 2] == selector[2]
+                    && data[i + 3] == selector[3]
+            ) return true;
+        }
+        return false;
     }
 
     function settleRound(uint256 callerSeed) external {
@@ -364,7 +455,10 @@ contract RektJackpotHandler is Test {
         if (s.leader == rejecter) {
             _flag(hook.unclaimedPayout(s.leader) == owedWinner, "rejecting winner prize not parked");
             _flag(hook.totalPrizesPaid() == prizesBefore, "parked prize counted as paid");
-            if (owedWinner > 0) ghostParkedEvents++;
+            if (owedWinner > 0) {
+                ghostParkedEvents++;
+                _checkParkedClock(s.leader);
+            }
         } else {
             _flag(s.leader.balance - winnerBefore == owedWinner, "winner did not receive the prize");
             _flag(hook.unclaimedPayout(s.leader) == 0, "paid prize still recorded");
@@ -399,6 +493,7 @@ contract RektJackpotHandler is Test {
             _flag(hook.unclaimedPayout(payee) == owed, "rejected payout was not re-parked in full");
             _flag(payee.balance == before, "rejecter received ETH");
             ghostParkedEvents++;
+            _checkParkedClock(payee);
         } else {
             _flag(payee.balance - before == owed, "payee did not receive the owed amount");
             _flag(hook.unclaimedPayout(payee) == 0, "paid amount still recorded");
@@ -424,19 +519,88 @@ contract RektJackpotHandler is Test {
         uint256 before = recipient.balance;
         uint256 parkedBefore = hook.unclaimedPayout(recipient);
         uint256 jackpotBefore = hook.jackpotPool();
+        uint256 claimsBefore = _claims();
+        uint256 hookEthBefore = address(hook).balance;
+        if (recipient == rejecter) {
+            // The claim must fail as a whole: nothing parked, nothing redeemed, pending untouched.
+            vm.prank(caller);
+            try hook.claimCreatorFees() {
+                _flag(false, "claimCreatorFees succeeded for a rejecting recipient");
+            } catch (bytes memory reason) {
+                _flag(
+                    bytes4(reason) == RektJackpotHook.CreatorFeeTransferFailed.selector,
+                    "claimCreatorFees wrong revert for a rejecting recipient"
+                );
+            }
+            _flag(hook.pendingCreatorFees() == pending, "failed creator claim changed pending fees");
+            _flag(hook.unclaimedPayout(recipient) == parkedBefore, "failed creator claim parked something");
+            _flag(_claims() == claimsBefore && address(hook).balance == hookEthBefore, "failed creator claim moved ETH");
+            _flag(hook.parkedSince(recipient) == parkedSinceExpected(recipient), "failed creator claim set parkedSince");
+            return;
+        }
         vm.prank(caller);
         hook.claimCreatorFees();
         _flag(hook.pendingCreatorFees() == 0, "pending creator fees not cleared");
         _flag(hook.jackpotPool() == jackpotBefore, "creator claim touched the jackpot");
-        if (recipient == rejecter) {
-            _flag(hook.unclaimedPayout(recipient) == parkedBefore + pending, "rejected creator fees not parked");
-            ghostParkedEvents++;
-        } else {
-            _flag(recipient.balance - before == pending, "creator recipient did not receive the fees");
-            _flag(hook.unclaimedPayout(recipient) == parkedBefore, "creator claim changed parked amounts");
-            ghostCreatorPaid += pending;
-        }
+        _flag(recipient.balance - before == pending, "creator recipient did not receive the fees");
+        _flag(hook.unclaimedPayout(recipient) == parkedBefore, "creator claim changed parked amounts");
+        ghostCreatorPaid += pending;
         _snapshotMonotonic();
+    }
+
+    /// @dev Returns a payout parked for at least the grace period to the jackpot, after one more
+    /// delivery attempt. Anything not parked, or parked too recently, must be refused unchanged.
+    function recycleParkedPayout(uint256 payeeSeed, uint256 callerSeed) external {
+        address[] memory p = this.payees();
+        // Half the calls name the only payee that can ever be parked, so the success path is reached.
+        address payee = payeeSeed % 2 == 0 ? rejecter : p[payeeSeed % p.length];
+        address caller = _actor(callerSeed);
+        uint256 since = hook.parkedSince(payee);
+        uint256 owed = hook.unclaimedPayout(payee);
+        uint256 poolBefore = hook.jackpotPool();
+        uint256 prizesBefore = hook.totalPrizesPaid();
+        uint256 hookEthBefore = address(hook).balance;
+        uint256 claimsBefore = _claims();
+        bool recyclable = since != 0 && block.timestamp >= since + 1 days;
+
+        if (!recyclable) {
+            vm.prank(caller);
+            try hook.recycleParkedPayout(payee) {
+                _flag(false, "recycle succeeded for a payout that is not recyclable");
+            } catch (bytes memory reason) {
+                _flag(bytes4(reason) == RektJackpotHook.PayoutNotRecyclable.selector, "recycle wrong revert");
+            }
+            _flag(
+                hook.unclaimedPayout(payee) == owed && hook.jackpotPool() == poolBefore, "refused recycle changed state"
+            );
+            return;
+        }
+        // Only the rejecter can ever have a parked clock: everyone else accepts ETH on first delivery.
+        _flag(payee == rejecter, "an accepting payee had a parked payout");
+        _flag(owed > 0, "parked clock running with nothing owed");
+
+        vm.prank(caller);
+        hook.recycleParkedPayout(payee);
+        ghostRecycled += owed;
+
+        _flag(hook.unclaimedPayout(payee) == 0, "recycled payout still recorded");
+        _flag(hook.parkedSince(payee) == 0, "recycled payout still has a parked clock");
+        _flag(hook.jackpotPool() == poolBefore + owed, "recycled amount did not go to the jackpot");
+        _flag(hook.totalPrizesPaid() == prizesBefore, "recycled amount counted as paid");
+        _flag(payee.balance == 0, "rejecter received ETH on recycle");
+        _flag(_claims() + address(hook).balance == claimsBefore + hookEthBefore, "recycle moved ETH out of the hook");
+        firstParkedAt[payee] = 0;
+        _snapshotMonotonic();
+    }
+
+    /// @dev The parked clock starts at the first failed delivery and is never restarted by a re-park.
+    function _checkParkedClock(address payee) internal {
+        if (firstParkedAt[payee] == 0) firstParkedAt[payee] = block.timestamp;
+        _flag(hook.parkedSince(payee) == firstParkedAt[payee], "parkedSince is not the first failed delivery");
+    }
+
+    function parkedSinceExpected(address payee) public view returns (uint256) {
+        return firstParkedAt[payee];
     }
 
     function setCreatorFeeRecipient(uint256 seed) external {
@@ -601,7 +765,7 @@ contract RektJackpotHookInvariantTest is Test {
     /// @dev Every wei the hook owes (creator fees, jackpot, recorded payouts) is backed by an ERC-6909
     /// ETH claim on the manager or ETH already redeemed onto the hook, exactly.
     /// forge-config: default.invariant.runs = 256
-    /// forge-config: default.invariant.depth = 40
+    /// forge-config: default.invariant.depth = 60
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_everyWeiOwedIsBacked() public view {
         uint256 owed = hook.pendingCreatorFees() + hook.jackpotPool() + _sumUnclaimed();
@@ -610,7 +774,7 @@ contract RektJackpotHookInvariantTest is Test {
 
     /// @dev Fees are conserved: everything ever collected is either still owed or has been delivered.
     /// forge-config: default.invariant.runs = 256
-    /// forge-config: default.invariant.depth = 40
+    /// forge-config: default.invariant.depth = 60
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_feesAreConserved() public view {
         uint256 stillOwed = hook.pendingCreatorFees() + hook.jackpotPool() + _sumUnclaimed();
@@ -619,21 +783,43 @@ contract RektJackpotHookInvariantTest is Test {
     }
 
     /// @dev The manager always holds the ETH behind the hook's claims, and ETH sits on the hook only
-    /// while it waits for a recipient that rejected it.
+    /// while it waits for a recipient that rejected it, or because such a wait ended in a recycle.
     /// forge-config: default.invariant.runs = 256
-    /// forge-config: default.invariant.depth = 40
+    /// forge-config: default.invariant.depth = 60
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_ethCustody() public view {
         assertGe(address(manager).balance, _claims(), "manager holds less ETH than the hook's claims");
-        assertLe(address(hook).balance, _sumUnclaimed(), "hook holds ETH that is not a parked payout");
+        assertLe(
+            address(hook).balance,
+            _sumUnclaimed() + handler.ghostRecycled(),
+            "hook holds ETH that is neither a parked payout nor recycled"
+        );
         assertEq(token.balanceOf(address(hook)), 0, "hook must never hold REKTD");
         assertEq(manager.balanceOf(address(hook), uint256(uint160(address(token)))), 0, "hook holds REKTD claims");
+    }
+
+    /// @dev A parked clock runs only while something undeliverable is owed, never in the future, and
+    /// only for the payee that rejects ETH; the creator's fees are never parked.
+    /// forge-config: default.invariant.runs = 256
+    /// forge-config: default.invariant.depth = 60
+    /// forge-config: default.invariant.fail-on-revert = true
+    function invariant_parkedClockConsistent() public view {
+        address[] memory p = handler.payees();
+        address rejecter = handler.rejecter();
+        for (uint256 i = 0; i < p.length; i++) {
+            uint256 since = hook.parkedSince(p[i]);
+            if (since == 0) continue;
+            assertGt(hook.unclaimedPayout(p[i]), 0, "parked clock running with nothing owed");
+            assertLe(since, block.timestamp, "parked clock in the future");
+            assertEq(p[i], rejecter, "an accepting payee has a parked clock");
+            assertEq(since, handler.firstParkedAt(p[i]), "parked clock restarted");
+        }
     }
 
     /// @dev Round state is consistent: a leader and a countdown exist together; the leader is a real
     /// buyer; the countdown never reaches more than 600 seconds ahead.
     /// forge-config: default.invariant.runs = 256
-    /// forge-config: default.invariant.depth = 40
+    /// forge-config: default.invariant.depth = 60
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_roundStateIsConsistent() public view {
         address leader = hook.currentLeader();
@@ -658,7 +844,7 @@ contract RektJackpotHookInvariantTest is Test {
 
     /// @dev Jackpot arithmetic: the split always sums to the pool and the ticket floor holds.
     /// forge-config: default.invariant.runs = 256
-    /// forge-config: default.invariant.depth = 40
+    /// forge-config: default.invariant.depth = 60
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_jackpotArithmetic() public view {
         (uint256 prize, uint256 burn, uint256 rollover) = hook.jackpotSplit();
@@ -676,7 +862,7 @@ contract RektJackpotHookInvariantTest is Test {
     /// fee on the right side, ticket and extension rules, settlement splits, parking, monotonic totals,
     /// and every refused attack.
     /// forge-config: default.invariant.runs = 256
-    /// forge-config: default.invariant.depth = 40
+    /// forge-config: default.invariant.depth = 60
     /// forge-config: default.invariant.fail-on-revert = true
     function invariant_handlerPostconditionsHeld() public view {
         assertFalse(handler.violated(), handler.violation());
