@@ -7,7 +7,9 @@ import {IPoolManager} from "v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "v4-core/src/interfaces/IHooks.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/src/types/PoolOperation.sol";
@@ -25,8 +27,23 @@ contract RejectEth {
     }
 }
 
+/// @dev A recipient that can be switched between rejecting and accepting ETH.
+contract ToggleRejectEth {
+    bool public accepting;
+
+    function setAccepting(bool value) external {
+        accepting = value;
+    }
+
+    receive() external payable {
+        require(accepting, "no");
+    }
+}
+
 contract RektJackpotHookTest is Test {
     using stdStorage for StdStorage;
+    using StateLibrary for IPoolManager;
+    using PoolIdLibrary for PoolKey;
 
     uint160 constant SQRT_PRICE_1_1 = 79228162514264337593543950336;
     uint24 constant POOL_FEE = 12_500;
@@ -108,16 +125,33 @@ contract RektJackpotHookTest is Test {
         internal
         returns (BalanceDelta)
     {
+        return _swapWithLimit(
+            zeroForOne,
+            amountSpecified,
+            zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1,
+            hookData,
+            value
+        );
+    }
+
+    /// @dev The hook accepts any router, so a swapper may pick any price limit and get a partial fill.
+    function _swapWithLimit(
+        bool zeroForOne,
+        int256 amountSpecified,
+        uint160 limit,
+        bytes memory hookData,
+        uint256 value
+    ) internal returns (BalanceDelta) {
         return swapRouter.swap{value: value}(
             key,
-            SwapParams({
-                zeroForOne: zeroForOne,
-                amountSpecified: amountSpecified,
-                sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_PRICE + 1 : TickMath.MAX_SQRT_PRICE - 1
-            }),
+            SwapParams({zeroForOne: zeroForOne, amountSpecified: amountSpecified, sqrtPriceLimitX96: limit}),
             PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
             hookData
         );
+    }
+
+    function _currentSqrtPrice() internal view returns (uint160 price) {
+        (price,,,) = IPoolManager(address(manager)).getSlot0(key.toId());
     }
 
     function _buyExactIn(uint256 ethIn, bytes memory hookData) internal returns (BalanceDelta) {
@@ -380,18 +414,58 @@ contract RektJackpotHookTest is Test {
         assertEq(hook.currentLeader(), address(0));
     }
 
+    /// @dev An exact-output sell stopped by its price limit cannot deliver the ETH asked for (plus the
+    /// fee), so it is refused rather than letting the seller receive less, or pay ETH, while being
+    /// charged 1% of the full request.
+    function test_exactOutputSellStoppedByPriceLimitReverts() public {
+        uint256 ethBefore = address(this).balance;
+        uint256 tokBefore = token.balanceOf(address(this));
+        uint160 limit = _currentSqrtPrice() + 1;
+        vm.expectRevert();
+        _swapWithLimit(false, int256(1 ether), limit, "", 1 ether);
+        assertEq(address(this).balance, ethBefore);
+        assertEq(token.balanceOf(address(this)), tokBefore);
+        assertEq(hookClaims(), 0);
+    }
+
+    /// @dev An exact-input buy cut short by its price limit still pays 1% of the amount it specified: the
+    /// BeforeSwapDelta is fixed before the pool runs. This is the documented limit of that fee shape.
+    function test_exactInputBuyStoppedByPriceLimitPaysFeeOnRequest() public {
+        uint256 asked = 0.04 ether;
+        BalanceDelta d = _swapWithLimit(true, -int256(asked), _currentSqrtPrice() - 1, abi.encode(bob), asked);
+        assertEq(uint256(uint128(-d.amount0())), asked / 100 + 2, "2 wei traded plus the 1% fee on the request");
+        assertEq(hookClaims(), asked / 100);
+        // Gross ETH spent is 2 wei plus the 0.0004 ETH fee: under the 0.0005 ETH ticket, so no lead.
+        assertEq(hook.currentLeader(), address(0), "fee plus 2 wei is no ticket");
+        _assertBacked(_payees());
+    }
+
+    /// @dev The fee a limited buy pays is real ETH spent, so it counts toward the ticket: asking for
+    /// 1 ETH and getting 2 wei still costs 0.01 ETH, which is a ticket at the floor.
+    function test_feePaidOnLimitedBuyCountsTowardTheTicket() public {
+        BalanceDelta d = _swapWithLimit(true, -int256(1 ether), _currentSqrtPrice() - 1, abi.encode(bob), 1 ether);
+        assertEq(uint256(uint128(-d.amount0())), 1 ether / 100 + 2);
+        assertGe(1 ether / 100 + 2, hook.minimumTicket());
+        assertEq(hook.currentLeader(), bob, "0.01 ETH actually paid is a ticket");
+        assertEq(hook.jackpotPool(), 1 ether / 200, "half of it is in the jackpot");
+    }
+
     // ------------------------------------------------------------------
     // Fresh manager seeded with tokens only
     // ------------------------------------------------------------------
 
-    function test_buyOnFreshManagerSeededWithTokensOnly() public {
-        PoolManager fresh = new PoolManager(address(this));
-        RektJackpotHook freshHook = _deployHook(fresh);
-        PoolSwapTest freshSwap = new PoolSwapTest(fresh);
+    /// @dev A fresh PoolManager whose pool holds REKTD only, as the launch seeds it: no ETH anywhere.
+    function _freshTokensOnlyPool()
+        internal
+        returns (PoolManager fresh, RektJackpotHook freshHook, PoolSwapTest freshSwap, PoolKey memory k)
+    {
+        fresh = new PoolManager(address(this));
+        freshHook = _deployHook(fresh);
+        freshSwap = new PoolSwapTest(fresh);
         PoolModifyLiquidityTest freshLp = new PoolModifyLiquidityTest(fresh);
         token.approve(address(freshLp), type(uint256).max);
         token.approve(address(freshSwap), type(uint256).max);
-        PoolKey memory k = key;
+        k = key;
         k.hooks = IHooks(address(freshHook));
         vm.prank(FACTORY);
         fresh.initialize(k, SQRT_PRICE_1_1);
@@ -404,6 +478,11 @@ contract RektJackpotHookTest is Test {
             ""
         );
         assertEq(address(fresh).balance, 0, "manager holds no ETH");
+    }
+
+    function test_buyOnFreshManagerSeededWithTokensOnly() public {
+        (PoolManager fresh, RektJackpotHook freshHook, PoolSwapTest freshSwap, PoolKey memory k) =
+            _freshTokensOnlyPool();
 
         uint256 ethIn = 0.01 ether;
         uint256 before = address(this).balance;
@@ -425,6 +504,48 @@ contract RektJackpotHookTest is Test {
         assertEq(OWNER.balance - ownerBefore, ethIn / 200);
         assertEq(freshHook.pendingCreatorFees(), 0);
         assertEq(fresh.balanceOf(address(freshHook), ETH_ID), ethIn / 200);
+    }
+
+    /// @dev On the thinly funded launch pool an exact-output sell asking for more ETH than the pool
+    /// holds is refused instead of being filled short with the fee charged on the full request.
+    function test_exactOutputSellOnThinPoolIsRefusedNotUnderfilled() public {
+        (, RektJackpotHook freshHook, PoolSwapTest freshSwap, PoolKey memory k) = _freshTokensOnlyPool();
+        freshSwap.swap{value: 0.01 ether}(
+            k,
+            SwapParams({
+                zeroForOne: true, amountSpecified: -int256(0.01 ether), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            abi.encode(alice)
+        );
+        uint256 claimsBefore = freshHook.poolManager().balanceOf(address(freshHook), ETH_ID);
+        uint256 ethBefore = address(this).balance;
+        uint256 tokBefore = token.balanceOf(address(this));
+
+        vm.expectRevert();
+        freshSwap.swap{value: 1 ether}(
+            k,
+            SwapParams({
+                zeroForOne: false, amountSpecified: int256(1 ether), sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertEq(address(this).balance, ethBefore, "seller paid no ETH");
+        assertEq(token.balanceOf(address(this)), tokBefore, "seller kept the tokens");
+        assertEq(freshHook.poolManager().balanceOf(address(freshHook), ETH_ID), claimsBefore, "no fee charged");
+
+        // An exact-output sell the pool can fill still works there.
+        freshSwap.swap(
+            k,
+            SwapParams({
+                zeroForOne: false, amountSpecified: int256(0.001 ether), sqrtPriceLimitX96: TickMath.MAX_SQRT_PRICE - 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        assertEq(address(this).balance - ethBefore, 0.001 ether);
+        assertEq(freshHook.poolManager().balanceOf(address(freshHook), ETH_ID) - claimsBefore, 0.001 ether / 100);
     }
 
     // ------------------------------------------------------------------
@@ -475,6 +596,42 @@ contract RektJackpotHookTest is Test {
     function test_exactOutputBuyUsesGrossEthForTicket() public {
         // Gross ETH in = pool input + fee; the ticket is judged on that gross amount.
         _swap(true, int256(0.001 ether), abi.encode(bob), 1 ether);
+        assertEq(hook.currentLeader(), bob);
+    }
+
+    /// @dev An exact-input buy that names the minimum ticket but caps the price so the pool fills only
+    /// 2 wei is judged on the ETH the pool took, not on the amount asked: it does not take the lead.
+    function test_partialFillBuyDoesNotTakeTheLead() public {
+        _buyExactIn(1 ether, abi.encode(alice));
+        uint256 minTicket = hook.minimumTicket();
+        assertEq(minTicket, 0.0005 ether);
+        uint256 end = hook.roundEndTime();
+        vm.warp(block.timestamp + 300);
+
+        BalanceDelta d = _swapWithLimit(true, -int256(minTicket), _currentSqrtPrice() - 1, abi.encode(bob), minTicket);
+        assertLt(uint256(uint128(-d.amount0())) + minTicket / 100, minTicket, "gross ETH in is below the ticket");
+        assertEq(hook.currentLeader(), alice, "bob did not pay the ticket");
+        assertEq(hook.roundEndTime(), end, "no extension");
+        assertEq(hookClaims(), 1 ether / 100 + minTicket / 100, "the fee on the request is still charged");
+
+        // Fully filled, the same ticket takes the lead and extends.
+        _buyExactIn(hook.minimumTicket(), abi.encode(bob));
+        assertEq(hook.currentLeader(), bob);
+        assertEq(hook.roundEndTime(), end + 120);
+        _assertBacked(_payees());
+    }
+
+    /// @dev A buy that stops short of a full fill but still moves at least the ticket through the pool
+    /// does take the lead: the judged amount is what the pool took plus the fee.
+    function test_partialFillBuyAboveTicketStillLeads() public {
+        _buyExactIn(1 ether, abi.encode(alice));
+        uint256 minTicket = hook.minimumTicket();
+        // Limit a little below the current price: the pool absorbs some ETH before stopping.
+        uint160 limit = uint160(uint256(_currentSqrtPrice()) * 999 / 1000);
+        BalanceDelta d = _swapWithLimit(true, -int256(100 ether), limit, abi.encode(bob), 100 ether);
+        uint256 poolTook = uint256(uint128(-d.amount0())) - 1 ether;
+        assertGt(poolTook, minTicket, "the pool took more than a ticket");
+        assertLt(poolTook, 99 ether, "but it was a partial fill");
         assertEq(hook.currentLeader(), bob);
     }
 
@@ -647,30 +804,152 @@ contract RektJackpotHookTest is Test {
         _assertBacked(_payees());
     }
 
-    function test_claimCreatorFeesParksWhenRecipientRejects() public {
+    /// @dev A creator fee recipient that rejects ETH makes the claim revert; nothing is parked under it
+    /// and the fees stay pending for the owner to redirect.
+    function test_claimCreatorFeesRevertsWhenRecipientRejects() public {
         address rejecter = address(new RejectEth());
         vm.prank(OWNER);
         hook.setCreatorFeeRecipient(rejecter);
         _buyExactIn(2 ether);
         uint256 pending = hook.pendingCreatorFees();
+        vm.expectRevert(RektJackpotHook.CreatorFeeTransferFailed.selector);
         hook.claimCreatorFees();
-        assertEq(hook.pendingCreatorFees(), 0);
-        assertEq(hook.unclaimedPayout(rejecter), pending);
-        assertEq(address(hook).balance, pending);
+        assertEq(hook.pendingCreatorFees(), pending, "fees stay pending");
+        assertEq(hook.unclaimedPayout(rejecter), 0, "nothing parked");
+        assertEq(hook.parkedSince(rejecter), 0);
+        _assertBacked(_payees());
 
-        // Once the recipient changes, the parked amount is still that address's, and a later claim
-        // reuses ETH already on the hook before touching the manager.
+        // The owner redirects and anyone claims the whole amount.
         vm.prank(OWNER);
         hook.setCreatorFeeRecipient(OWNER);
-        _buyExactIn(2 ether);
         uint256 ownerBefore = OWNER.balance;
+        vm.prank(alice);
         hook.claimCreatorFees();
         assertEq(OWNER.balance - ownerBefore, pending);
+        assertEq(hook.pendingCreatorFees(), 0);
         assertEq(address(hook).balance, 0);
-        assertEq(hook.unclaimedPayout(rejecter), pending);
-        address[] memory payees = new address[](1);
-        payees[0] = rejecter;
+        _assertBacked(_payees());
+    }
+
+    /// @dev Anyone can crown any address through hookData, including a contract that can never
+    /// receive ETH. Its prize is parked at settlement and, after the grace period, anyone can return
+    /// it to the jackpot instead of it being dead forever.
+    function test_prizeCrownedToRejectingContractIsRecycledAfterGrace() public {
+        _buyExactIn(10 ether, abi.encode(alice));
+        // A griefer names the token contract, which has no receive function, as the buyer.
+        _buyExactIn(0.01 ether, abi.encode(address(token)));
+        assertEq(hook.currentLeader(), address(token));
+        uint256 pool = hook.jackpotPool();
+        uint256 prize = pool * 60 / 100;
+        vm.warp(hook.roundEndTime() + 1);
+
+        vm.expectEmit(true, false, false, true);
+        emit RektJackpotHook.PayoutParked(address(token), prize);
+        hook.settleRound();
+        uint256 parkedAt = block.timestamp;
+        assertEq(hook.unclaimedPayout(address(token)), prize);
+        assertEq(hook.parkedSince(address(token)), parkedAt);
+        assertEq(hook.jackpotPool(), pool * 20 / 100);
+        assertEq(DEAD.balance, pool * 20 / 100, "the burn still went through");
+
+        // Retrying keeps the original parking time; recycling is refused during the grace period.
+        hook.claimPayout(address(token));
+        assertEq(hook.parkedSince(address(token)), parkedAt);
+        vm.expectRevert(RektJackpotHook.PayoutNotRecyclable.selector);
+        hook.recycleParkedPayout(address(token));
+        vm.warp(parkedAt + hook.PARK_GRACE_PERIOD() - 1);
+        vm.expectRevert(RektJackpotHook.PayoutNotRecyclable.selector);
+        hook.recycleParkedPayout(address(token));
+
+        // After the grace period anyone returns it to the jackpot.
+        vm.warp(parkedAt + hook.PARK_GRACE_PERIOD());
+        uint256 jackpotBefore = hook.jackpotPool();
+        vm.expectEmit(true, false, false, true);
+        emit RektJackpotHook.PayoutRecycled(address(token), prize);
+        vm.prank(bob);
+        hook.recycleParkedPayout(address(token));
+        assertEq(hook.jackpotPool(), jackpotBefore + prize);
+        assertEq(hook.unclaimedPayout(address(token)), 0);
+        assertEq(hook.parkedSince(address(token)), 0);
+        assertEq(hook.totalPrizesPaid(), 0);
+        address[] memory payees = new address[](3);
+        payees[0] = address(token);
+        payees[1] = DEAD;
+        payees[2] = alice;
         _assertBacked(payees);
+        vm.expectRevert(RektJackpotHook.PayoutNotRecyclable.selector);
+        hook.recycleParkedPayout(address(token));
+
+        // The recycled ETH is really in play: the next round pays its winner out of it.
+        uint256 ticket = hook.minimumTicket();
+        _buyExactIn(ticket, abi.encode(alice));
+        assertEq(hook.jackpotPool(), jackpotBefore + prize + ticket / 200);
+        uint256 expectedPrize = hook.jackpotPool() * 60 / 100;
+        vm.warp(hook.roundEndTime() + 1);
+        uint256 aliceBefore = alice.balance;
+        hook.settleRound();
+        assertEq(alice.balance - aliceBefore, expectedPrize);
+        _assertBacked(payees);
+    }
+
+    /// @dev A prize whose delivery was never attempted (settled inside a swap) is the winner's to claim
+    /// at any time and can never be recycled.
+    function test_unattemptedPayoutIsNeverRecyclable() public {
+        _buyExactIn(10 ether, abi.encode(alice));
+        vm.warp(hook.roundEndTime() + 1);
+        _buyExactIn(0.001 ether, abi.encode(bob));
+        uint256 prize = hook.unclaimedPayout(alice);
+        assertGt(prize, 0);
+        assertEq(hook.parkedSince(alice), 0);
+        vm.warp(block.timestamp + 365 days);
+        vm.expectRevert(RektJackpotHook.PayoutNotRecyclable.selector);
+        hook.recycleParkedPayout(alice);
+        uint256 aliceBefore = alice.balance;
+        hook.claimPayout(alice);
+        assertEq(alice.balance - aliceBefore, prize);
+    }
+
+    /// @dev Recycling first retries delivery, so a winner whose wallet accepts ETH again gets paid, and
+    /// a successful delivery clears the parking record.
+    function test_recycleRetriesDeliveryBeforeReturningToJackpot() public {
+        ToggleRejectEth wallet = new ToggleRejectEth();
+        _buyExactIn(10 ether, abi.encode(address(wallet)));
+        uint256 prize = hook.jackpotPool() * 60 / 100;
+        vm.warp(hook.roundEndTime() + 1);
+        hook.settleRound();
+        assertEq(hook.unclaimedPayout(address(wallet)), prize);
+        assertGt(hook.parkedSince(address(wallet)), 0);
+
+        wallet.setAccepting(true);
+        vm.warp(block.timestamp + hook.PARK_GRACE_PERIOD());
+        uint256 jackpotBefore = hook.jackpotPool();
+        vm.expectEmit(true, false, false, true);
+        emit RektJackpotHook.PayoutSent(address(wallet), prize);
+        hook.recycleParkedPayout(address(wallet));
+        assertEq(address(wallet).balance, prize);
+        assertEq(hook.unclaimedPayout(address(wallet)), 0);
+        assertEq(hook.parkedSince(address(wallet)), 0);
+        assertEq(hook.jackpotPool(), jackpotBefore, "nothing went back to the jackpot");
+        assertEq(hook.totalPrizesPaid(), prize);
+    }
+
+    /// @dev The dashboard clock reads zero exactly when the round can be settled, never a second early.
+    function test_timeRemainingIsZeroExactlyWhenExpired() public {
+        _buyExactIn(0.001 ether, abi.encode(alice));
+        uint256 end = hook.roundEndTime();
+        assertEq(hook.timeRemaining(), 600);
+        vm.warp(end - 1);
+        assertEq(hook.timeRemaining(), 1);
+        vm.warp(end);
+        assertEq(hook.timeRemaining(), 1, "still live at roundEndTime");
+        assertFalse(hook.roundExpired());
+        vm.expectRevert(RektJackpotHook.RoundNotOver.selector);
+        hook.settleRound();
+        vm.warp(end + 1);
+        assertEq(hook.timeRemaining(), 0);
+        assertTrue(hook.roundExpired());
+        hook.settleRound();
+        assertEq(hook.timeRemaining(), 0);
     }
 
     function test_fullCycleKeepsAccountingBacked() public {

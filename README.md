@@ -109,7 +109,7 @@ fee. It is always taken in ETH, never in REKTD, and nothing is converted later:
 | Swap shape                     | Where the fee is taken                          | Formula                                   |
 | ------------------------------ | ----------------------------------------------- | ----------------------------------------- |
 | Buy, exact input (ETH in)      | `beforeSwap` return delta on the specified side | 1% of the ETH the trader sends; the pool swaps the other 99%. |
-| Sell, exact output (ETH out)   | `beforeSwap` return delta on the specified side | 1% of the ETH the trader asked for; the pool outputs that much more; the trader receives exactly the amount asked. |
+| Sell, exact output (ETH out)   | `beforeSwap` return delta on the specified side | 1% of the ETH the trader asked for; the pool outputs that much more; the trader receives exactly the amount asked. If the pool cannot output the amount asked plus the fee (price limit hit, or the pool holds too little ETH), the swap reverts with `EthOutputNotFilled` instead of filling short. |
 | Buy, exact output (REKTD out)  | `afterSwap` return delta on the unspecified side| 1% of the ETH the pool took; the trader pays it on top. |
 | Sell, exact input (REKTD in)   | `afterSwap` return delta on the unspecified side| 1% of the ETH the pool paid out; the trader receives the other 99%. |
 
@@ -118,6 +118,21 @@ In `afterSwap` the hook mints itself an ERC-6909 claim on the PoolManager for th
 It never calls `take`, never transfers ETH and never needs the manager to hold ETH, so the first
 buy on a pool seeded with tokens only works (tested). Because the deltas are fixed functions of the
 swap parameters, the V4Quoter returns the exact net amounts.
+
+Partial fills. The two shapes charged through `beforeSwap` fix the fee before the pool runs, as the
+brief requires, so it cannot follow a fill the pool cuts short at a caller-chosen `sqrtPriceLimitX96`:
+
+- An exact-input buy stopped by its price limit still pays 1% of the ETH it specified (asking for
+  1 ETH with a limit one unit below the current price trades 2 wei and pays 0.01 ETH). The limit is
+  the swapper's own choice; the UniversalRouter and V4Quoter always pass the MIN/MAX limits, so a
+  dashboard swap is always a full fill. The ticket is judged on what was really paid (see below).
+- An exact-output sell that the pool cannot fill in full is refused (`EthOutputNotFilled`) rather
+  than paying the seller less than asked, or, once the shortfall exceeds the fee, making the seller
+  pay ETH. This matters on the launch pool, which is seeded with REKTD only: a sell asking for more
+  ETH than the pool holds reverts. A V4Quoter quote for such a sell reverts too; quote and sell
+  exact-input, or ask for less.
+- The two shapes charged in `afterSwap` use the ETH the pool actually moved, so a partial fill there
+  pays exactly 1% of it.
 
 Each fee splits 50/50: `pendingCreatorFees` for `creatorFeeRecipient` and `jackpotPool`. The
 creator share is withdrawn by anyone calling `claimCreatorFees()`, which unlocks the manager, burns
@@ -136,13 +151,16 @@ Constants (all in `RektJackpotHook`):
 | `WINNER_BPS`        | 6000         | Winner's share of the jackpot at settlement.              |
 | `BURN_BPS`          | 2000         | Share sent to `0x000000000000000000000000000000000000dEaD`. |
 | `ROLLOVER_BPS`      | 2000         | Share kept in `jackpotPool` for the next round.           |
+| `PARK_GRACE_PERIOD` | 1 day        | How long an undeliverable prize stays claimable before anyone may return it to the jackpot (my choice; the brief is silent). |
 
 Rules:
 
 - A buy (ETH to REKTD) whose gross ETH input is at least `minimumTicket()` makes the resolved
-  buyer `currentLeader`. Gross input is the amount sent on an exact-input buy, and pool input plus
-  fee on an exact-output buy. The minimum ticket is evaluated against `jackpotPool` as it stood
-  before this swap's fee was added, which is what a dashboard reading `minimumTicket()` shows.
+  buyer `currentLeader`. Gross input is the ETH the pool actually took plus the hook fee, on both
+  buy shapes: for a fully filled exact-input buy that is the amount sent, and a buy cut short by its
+  price limit is judged on the 2 wei it traded plus the fee it really paid, never on the amount it
+  merely specified. The minimum ticket is evaluated against `jackpotPool` as it stood before this
+  swap's fee was added, which is what a dashboard reading `minimumTicket()` shows.
 - The buyer is the address in `hookData` when it is exactly 32 bytes, else `tx.origin`. A zero or
   `dEaD` buyer (for example a quoter `eth_call` with no sender) is charged the fee but does not take
   the lead, and no revert happens. `hookData` of any other length, or 32 bytes that are not a clean
@@ -154,6 +172,10 @@ Rules:
   `unclaimedPayout[dEaD]` with no external calls, so the current swap can open the next round.
 - `settleRound()` (anyone) settles an expired round and pays the winner and the burn address in
   ETH. `claimPayout(address)` (anyone) delivers whatever `unclaimedPayout[address]` holds.
+- `timeRemaining()` is zero exactly when `roundExpired()` is true. The brief defines expiry as
+  `block.timestamp > roundEndTime`, so the round is still live in the second equal to
+  `roundEndTime`; the view returns 1 then, and 0 only once `settleRound()` can be called. A clock
+  showing 00:00 therefore never coincides with a settle that reverts or a buy that still extends.
 
 Sells never affect the round. Nothing in the hook uses randomness.
 
@@ -166,12 +188,21 @@ redeemed and sitting on the hook. The tested invariant is
 - Claims are redeemed only in `settleRound`, `claimCreatorFees` and `claimPayout`, through
   `poolManager.unlock`; `unlockCallback` burns the claim and takes ETH to the hook. The hook's
   `receive` accepts ETH only from the PoolManager, so stray ETH cannot distort the accounting.
-- If a recipient rejects ETH, the amount is parked in `unclaimedPayout[recipient]` and the call
-  does not revert, so a rejecting winner or creator wallet can never block settlement. A parked
-  amount can be retried with `claimPayout`; a contract that always rejects keeps it parked for good.
+- If a winner rejects ETH, the prize is parked in `unclaimedPayout[winner]`, `parkedSince[winner]`
+  records when, and the call does not revert, so a rejecting winner can never block settlement. A
+  parked amount can be retried with `claimPayout` at any time.
+- Undeliverable prizes are not dead money. Any swapper can name any address in `hookData`, so a
+  third party can crown a contract that can never receive ETH (the token, the PoolManager, this
+  hook). Once a payout has been parked for `PARK_GRACE_PERIOD`, anyone may call
+  `recycleParkedPayout(address)`: it makes one more delivery attempt and, if that fails too, returns
+  the amount to `jackpotPool` (`PayoutRecycled`). Payouts whose delivery was never attempted, such as
+  a prize settled inside a swap that the winner simply has not claimed, are never recyclable.
+- `claimCreatorFees()` reverts (`CreatorFeeTransferFailed`) when `creatorFeeRecipient` rejects
+  ETH; nothing is parked and `pendingCreatorFees` is untouched, so the owner can point the recipient
+  at a wallet that accepts ETH and anyone can claim again.
 - The burn address has no code, so the burn transfer always succeeds. `totalBurned` counts ETH
   actually delivered there.
-- All three claim functions are `nonReentrant`; state is updated before any transfer.
+- All four claim and recycle functions are `nonReentrant`; state is updated before any transfer.
 
 ## After launch: operational responsibilities
 
@@ -182,11 +213,20 @@ Nothing needs configuring for the hook to work: `$owner` becomes both owner and
 | ------------------------------ | --------- | ---------------------------------------------------------------------- |
 | `settleRound()`                | anyone    | Once a round expires. The dashboard exposes it; nothing settles by itself without a call or a swap. |
 | `claimPayout(address)`         | anyone    | For prizes and burns settled inside a swap, and for parked transfers.  |
-| `claimCreatorFees()`           | anyone    | Sends accumulated creator fees to `creatorFeeRecipient`.               |
-| `setCreatorFeeRecipient(addr)` | owner     | Emits `CreatorFeeRecipientUpdated`; rejects the zero address. Amounts already parked under the old recipient stay claimable for it. |
+| `claimCreatorFees()`           | anyone    | Sends accumulated creator fees to `creatorFeeRecipient`; reverts if it rejects ETH. |
+| `recycleParkedPayout(addr)`    | anyone    | After `PARK_GRACE_PERIOD`, retries a parked prize and otherwise returns it to the jackpot. |
+| `setCreatorFeeRecipient(addr)` | owner     | Emits `CreatorFeeRecipientUpdated`; rejects the zero address. Set it only to a wallet that accepts plain ETH transfers. |
 
 The owner has no other power: no pause, no fee change, no withdrawal of the jackpot, no upgrade.
 The token has no owner at all.
+
+Trust assumption on the owner: `pendingCreatorFees` is one counter, and `claimCreatorFees` pays
+whatever has accrued to the recipient current at claim time, so the owner can redirect fees that
+accrued under a previous recipient by changing it before they are claimed. On this launch the owner
+is the brief's creator fee recipient, so only the payee can redirect its own fees; a transferred
+owner (single-step `Ownable`, `renounceOwnership` available) gains the same power over the named
+recipient. Anyone can flush accrued fees to the current recipient first by calling
+`claimCreatorFees()`.
 
 ## Assumptions and choices the brief left open
 
@@ -209,14 +249,17 @@ split (80% pool, 10% swarm distributor, 10% payer) is done by the factory, not b
 
 ## Tests
 
-`test/RektdToken.t.sol` (6) and `test/RektJackpotHook.t.sol` (36, three of them fuzzed) cover:
+`test/RektdToken.t.sol` (6) and `test/RektJackpotHook.t.sol` (46, three of them fuzzed) cover:
 supply and transfer; permissions versus address bits; every enabled callback refusing callers other
 than the PoolManager; single-pool and ETH-pair initialization rules; the fee on all four swap shapes,
-including a sell that stops at a price limit and a buy on a fresh PoolManager seeded with tokens
-only; ticket thresholds, leader changes, extensions and the cap; buyer resolution from `hookData`,
-`tx.origin`, zero, `dEaD` and malformed data; settlement by `settleRound` and inside a later swap;
-rejecting recipients being parked and retried; creator fee claims; the backing invariant across a
-full cycle.
+including sells and buys that stop at a price limit, an exact-output sell refused on the thin launch
+pool, and a buy on a fresh PoolManager seeded with tokens only; ticket thresholds, leader changes,
+extensions and the cap; a price-limited buy that cannot take the lead on the amount it only
+specified; buyer resolution from `hookData`, `tx.origin`, zero, `dEaD` and malformed data;
+settlement by `settleRound` and inside a later swap; rejecting winners being parked, retried and
+recycled after the grace period, and unattempted payouts never being recyclable; creator fee claims
+and the revert on a rejecting recipient; `timeRemaining` agreeing with `roundExpired`; the backing
+invariant across a full cycle.
 
 `test/mocks/`, `test/floor/OwnerChecks.sol` and `src/HookFlags.sol` match what the launch floor
 tests under `.imd/reads/protected/univ4_hook/` import; those floor tests were rehearsed locally

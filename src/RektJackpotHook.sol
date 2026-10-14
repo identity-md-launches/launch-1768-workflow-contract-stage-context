@@ -56,6 +56,8 @@ contract RektJackpotHook is IHooks, IUnlockCallback, Ownable, ReentrancyGuard {
     uint256 public constant TICKET_POOL_BPS = 500;
     /// @notice Where the burned share is sent.
     address public constant BURN_ADDRESS = 0x000000000000000000000000000000000000dEaD;
+    /// @notice How long a payout whose delivery failed stays claimable before anyone may return it to the jackpot.
+    uint256 public constant PARK_GRACE_PERIOD = 1 days;
 
     // ---------------------------------------------------------------------
     // Immutable and storage
@@ -80,6 +82,8 @@ contract RektJackpotHook is IHooks, IUnlockCallback, Ownable, ReentrancyGuard {
     uint256 public jackpotPool;
     /// @notice Payouts recorded but not yet delivered: winner prizes, burn amounts, and parked transfers.
     mapping(address => uint256) public unclaimedPayout;
+    /// @notice When a payout to this address first failed to deliver; zero when nothing of its is parked.
+    mapping(address => uint256) public parkedSince;
 
     /// @notice Buyer currently holding the lead; zero when no round is running.
     address public currentLeader;
@@ -106,6 +110,7 @@ contract RektJackpotHook is IHooks, IUnlockCallback, Ownable, ReentrancyGuard {
     );
     event PayoutSent(address indexed recipient, uint256 amount);
     event PayoutParked(address indexed recipient, uint256 amount);
+    event PayoutRecycled(address indexed recipient, uint256 amount);
     event CreatorFeesClaimed(address indexed recipient, uint256 amount);
     event CreatorFeeRecipientUpdated(address indexed previous, address indexed current);
 
@@ -116,6 +121,9 @@ contract RektJackpotHook is IHooks, IUnlockCallback, Ownable, ReentrancyGuard {
     error NothingToClaim();
     error ZeroAddress();
     error EthNotAccepted();
+    error EthOutputNotFilled();
+    error CreatorFeeTransferFailed();
+    error PayoutNotRecyclable();
 
     modifier onlyPoolManager() {
         if (msg.sender != address(poolManager)) revert NotPoolManager();
@@ -170,10 +178,13 @@ contract RektJackpotHook is IHooks, IUnlockCallback, Ownable, ReentrancyGuard {
         return currentLeader != address(0) && block.timestamp > roundEndTime;
     }
 
-    /// @notice Seconds left in the current round, zero when none is running or it has expired.
+    /// @notice Seconds left in the current round; zero exactly when `roundExpired()` is true (none running,
+    /// or the countdown has run out and the round can be settled). The round is still live in the second
+    /// `block.timestamp == roundEndTime`, so this returns 1 then rather than 0.
     function timeRemaining() external view returns (uint256) {
-        if (currentLeader == address(0) || block.timestamp >= roundEndTime) return 0;
-        return roundEndTime - block.timestamp;
+        if (currentLeader == address(0) || block.timestamp > roundEndTime) return 0;
+        uint256 left = roundEndTime - block.timestamp;
+        return left == 0 ? 1 : left;
     }
 
     /// @notice How the current jackpot would split if the round ended now.
@@ -185,8 +196,8 @@ contract RektJackpotHook is IHooks, IUnlockCallback, Ownable, ReentrancyGuard {
     // Owner
     // ---------------------------------------------------------------------
 
-    /// @notice Changes where future creator fee claims are sent. Fees already parked under the old
-    /// recipient in `unclaimedPayout` stay claimable for that address.
+    /// @notice Changes where creator fee claims are sent. Everything in `pendingCreatorFees`, claimed or
+    /// not, goes to the recipient current at claim time; call `claimCreatorFees` first to flush it.
     function setCreatorFeeRecipient(address recipient) external onlyOwner {
         if (recipient == address(0)) revert ZeroAddress();
         emit CreatorFeeRecipientUpdated(creatorFeeRecipient, recipient);
@@ -240,10 +251,20 @@ contract RektJackpotHook is IHooks, IUnlockCallback, Ownable, ReentrancyGuard {
         int128 unspecifiedDelta;
 
         if (_ethIsSpecified(params)) {
-            // Exact-input buy or exact-output sell: the fee was already taken through beforeSwap.
+            // Exact-input buy or exact-output sell: the fee was already taken through beforeSwap, and
+            // `delta` is the pool's own result (the hook's fee delta is subtracted afterwards).
             uint256 specified = _abs(params.amountSpecified);
             fee = _feeOn(specified);
-            if (params.zeroForOne) grossEthIn = specified;
+            uint256 ethMoved = _abs(int256(delta.amount0()));
+            if (params.zeroForOne) {
+                // The ticket is judged on the ETH the pool actually took plus the fee, so a buy that the
+                // price limit cut short cannot take the lead on the amount it merely asked for.
+                grossEthIn = ethMoved + fee;
+            } else if (ethMoved < specified + fee) {
+                // The pool could not produce the ETH asked for plus the fee: the seller would receive
+                // less than requested, or even pay ETH once the shortfall exceeds the fee. Refuse it.
+                revert EthOutputNotFilled();
+            }
         } else {
             // Exact-output buy or exact-input sell: the ETH side is the unspecified currency.
             uint256 ethMoved = _abs(int256(delta.amount0()));
@@ -344,18 +365,16 @@ contract RektJackpotHook is IHooks, IUnlockCallback, Ownable, ReentrancyGuard {
     }
 
     /// @notice Sends the creator's accumulated fees to `creatorFeeRecipient`.
+    /// @dev Reverts, leaving `pendingCreatorFees` untouched, when the recipient rejects ETH: the owner
+    /// then points `setCreatorFeeRecipient` at a wallet that accepts it and anyone claims again.
     function claimCreatorFees() external nonReentrant {
         uint256 amount = pendingCreatorFees;
         if (amount == 0) revert NothingToClaim();
         pendingCreatorFees = 0;
         address recipient = creatorFeeRecipient;
         _withdrawFromManager(amount);
-        if (_send(recipient, amount)) {
-            emit CreatorFeesClaimed(recipient, amount);
-        } else {
-            unclaimedPayout[recipient] += amount;
-            emit PayoutParked(recipient, amount);
-        }
+        if (!_send(recipient, amount)) revert CreatorFeeTransferFailed();
+        emit CreatorFeesClaimed(recipient, amount);
     }
 
     /// @notice Delivers everything recorded in `unclaimedPayout[recipient]`: a prize settled during a
@@ -363,6 +382,24 @@ contract RektJackpotHook is IHooks, IUnlockCallback, Ownable, ReentrancyGuard {
     function claimPayout(address recipient) external nonReentrant {
         if (unclaimedPayout[recipient] == 0) revert NothingToClaim();
         _deliver(recipient);
+    }
+
+    /// @notice Returns a payout that has been undeliverable for `PARK_GRACE_PERIOD` to the jackpot.
+    /// @dev Anyone may buy with `hookData` naming any address, so a leader can be a contract that
+    /// rejects ETH (the token, the PoolManager, this hook). Its prize is parked at settlement; this
+    /// makes one more delivery attempt and, if that fails too, moves the amount back into `jackpotPool`
+    /// so no third party can take a prize out of the game for good. Payouts whose delivery was never
+    /// attempted (a prize settled inside a swap and not yet claimed) are not recyclable.
+    function recycleParkedPayout(address recipient) external nonReentrant {
+        uint256 since = parkedSince[recipient];
+        if (since == 0 || block.timestamp < since + PARK_GRACE_PERIOD) revert PayoutNotRecyclable();
+        _deliver(recipient);
+        uint256 amount = unclaimedPayout[recipient];
+        if (amount == 0) return;
+        unclaimedPayout[recipient] = 0;
+        parkedSince[recipient] = 0;
+        jackpotPool += amount;
+        emit PayoutRecycled(recipient, amount);
     }
 
     /// @inheritdoc IUnlockCallback
@@ -441,9 +478,11 @@ contract RektJackpotHook is IHooks, IUnlockCallback, Ownable, ReentrancyGuard {
         if (_send(recipient, amount)) {
             if (recipient == BURN_ADDRESS) totalBurned += amount;
             else totalPrizesPaid += amount;
+            if (parkedSince[recipient] != 0) parkedSince[recipient] = 0;
             emit PayoutSent(recipient, amount);
         } else {
             unclaimedPayout[recipient] = amount;
+            if (parkedSince[recipient] == 0) parkedSince[recipient] = block.timestamp;
             emit PayoutParked(recipient, amount);
         }
     }
